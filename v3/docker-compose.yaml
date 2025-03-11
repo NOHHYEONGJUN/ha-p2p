@@ -1,0 +1,251 @@
+version: '3'
+
+services:
+  etcd:
+    image: bitnami/etcd:latest
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_NAME=etcd-server
+      - ETCD_ADVERTISE_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+      - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://0.0.0.0:2380
+      - ETCD_INITIAL_CLUSTER=etcd-server=http://0.0.0.0:2380
+      - ETCD_INITIAL_CLUSTER_STATE=new
+      - ETCD_INITIAL_CLUSTER_TOKEN=etcd-token-1
+      - ETCD_ENABLE_V2=true
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # 클러스터 1 노드들
+  node_1_1:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_1_1 --cluster 1 --type manager --primary --secondary node_2_1
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5001
+      - DEBUG=true
+
+  node_1_2:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_1_2 --cluster 1 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5002
+      - DEBUG=true
+
+  node_1_3:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_1_3 --cluster 1 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5003
+      - DEBUG=true
+
+  node_1_4:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_1_4 --cluster 1 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5004
+      - DEBUG=true
+
+  node_1_5:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_1_5 --cluster 1 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5005
+      - DEBUG=true
+
+  # 클러스터 2 노드들
+  node_2_1:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_2_1 --cluster 2 --type manager --primary --backup-for 1 --secondary node_3_1
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5011
+      - DEBUG=true
+
+  node_2_2:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_2_2 --cluster 2 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5012
+      - DEBUG=true
+
+  node_2_3:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_2_3 --cluster 2 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5013
+      - DEBUG=true
+
+  node_2_4:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_2_4 --cluster 2 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5014
+      - DEBUG=true
+
+  node_2_5:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_2_5 --cluster 2 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5015
+      - DEBUG=true
+
+  # 클러스터 3 노드들
+  node_3_1:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_3_1 --cluster 3 --type manager --primary --backup-for 2 --secondary node_1_1
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5021
+      - DEBUG=true
+
+  node_3_2:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_3_2 --cluster 3 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5022
+      - DEBUG=true
+
+  node_3_3:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_3_3 --cluster 3 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5023
+      - DEBUG=true
+
+  node_3_4:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_3_4 --cluster 3 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5024
+      - DEBUG=true
+
+  node_3_5:
+    build:
+      context: .
+      network: host
+    depends_on:
+      etcd:
+        condition: service_healthy
+    command: >
+      node_3_5 --cluster 3 --type participant
+    network_mode: host
+    environment:
+      - ETCD_HOST=localhost
+      - NODE_PORT=5025
+      - DEBUG=true
