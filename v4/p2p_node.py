@@ -1,3 +1,4 @@
+
 import time
 import json
 import random
@@ -11,7 +12,8 @@ from config import (
     HEARTBEAT_INTERVAL, MIN_ELECTION_TIMEOUT, MAX_ELECTION_TIMEOUT,
     NODE_INFO_PREFIX, MANAGER_INFO_PREFIX, CLUSTER_INFO_PREFIX, BACKUP_INFO_PREFIX,
     HEALTH_CHECK_INTERVAL, MAX_HEARTBEAT_MISS, NODE_PORT,
-    CLUSTER_BACKUP_MAP, CLUSTER_HEALTH_CHECK_INTERVAL, BACKUP_ACTIVATION_TIMEOUT
+    CLUSTER_BACKUP_MAP, CLUSTER_HEALTH_CHECK_INTERVAL, BACKUP_ACTIVATION_TIMEOUT,
+    LEADER_ELECTION_MIN_TIMEOUT, LEADER_ELECTION_MAX_TIMEOUT
 )
 
 # 로깅 설정
@@ -144,6 +146,52 @@ class Node:
         except Exception as e:
             logger.error(f"Error getting cluster nodes: {e}")
         return nodes
+    
+    def change_role(self, new_type: str, is_primary: bool = False):
+        """노드 역할 변경 (참여자 -> 관리자 등)"""
+        logger.info(f"Node {self.id} changing role from {self.type} to {new_type}")
+        self.type = new_type
+        self.metadata["type"] = new_type
+        self.metadata["last_updated"] = time.time()
+        
+        # 특별한 역할 변경 시 처리 (참여자 -> 관리자)
+        if new_type == "MANAGER":
+            # 참여 노드에서 관리 노드로 변경
+            self.register_to_etcd()
+            manager_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/{self.id}"
+            manager_info = {
+                "node_id": self.id,
+                "cluster_id": self.cluster_id,
+                "is_primary": is_primary,
+                "type": "MANAGER",
+                "status": self.status,
+                "last_updated": time.time()
+            }
+            self.etcd_client.put(manager_key, manager_info)
+            
+            # 클러스터 정보 업데이트 (새 관리자 등록)
+            if is_primary:
+                cluster_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/info"
+                cluster_info = {
+                    "cluster_id": self.cluster_id,
+                    "manager_id": self.id,
+                    "is_primary": is_primary,
+                    "node_count": 0,
+                    "last_updated": time.time()
+                }
+                self.etcd_client.put(cluster_key, cluster_info)
+                
+            # 역할 변경 이벤트 기록
+            event_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/events/{int(time.time())}"
+            event_data = {
+                "event_type": "MANAGER_PROMOTED",
+                "node_id": self.id,
+                "cluster_id": self.cluster_id,
+                "is_primary": is_primary,
+                "timestamp": time.time()
+            }
+            self.etcd_client.put(event_key, event_data)
+            logger.info(f"Node {self.id} promoted to {'PRIMARY' if is_primary else 'SECONDARY'} MANAGER")
 
 class ManagementNode(Node):
     """P2P 관리 노드 (매니저) 클래스"""
@@ -158,6 +206,10 @@ class ManagementNode(Node):
         self.backup_check_thread = None
         self.etcd_monitor_thread = None
         self.discovery_thread = None
+        
+        # 백업 관리자로서 감시 중인 클러스터 관련 정보
+        self.backup_watch_ids = None
+        self.backup_election_detected = False
     
     def initialize(self):
         logger.info(f"Management node {self.id} initializing for cluster {self.cluster_id}")
@@ -209,6 +261,47 @@ class ManagementNode(Node):
         }
         self.etcd_client.put(backup_key, backup_info)
         logger.info(f"Node {self.id} registered as backup manager for cluster {self.backup_for}")
+        
+        # 백업 대상 클러스터의 관리자 변경을 감시
+        self.watch_target_cluster_managers()
+    
+    def watch_target_cluster_managers(self):
+        """백업 대상 클러스터의 관리자 변경을 감시"""
+        if not self.backup_for:
+            return
+            
+        try:
+            def on_manager_change(event):
+                if self.backup_mode_active:
+                    # 새 관리자가 선출되었는지 확인
+                    try:
+                        managers_key = f"{MANAGER_INFO_PREFIX}/{self.backup_for}/"
+                        results = self.etcd_client.get_prefix(managers_key)
+                        
+                        for key, value in results:
+                            # temp_ 로 시작하지 않는 키만 처리 (실제 관리자)
+                            if "temp_" not in key and "/events/" not in key:
+                                manager_id = value.get("node_id")
+                                is_primary = value.get("is_primary", False)
+                                # 새 관리자가 활성화되고 프라이머리이며, 자신이 아니면 백업 비활성화
+                                if (manager_id != self.id and 
+                                    is_primary and 
+                                    value.get("status") == "ACTIVE"):
+                                    logger.info(f"새로운 관리자 {manager_id}가 클러스터 {self.backup_for}에서 감지됨")
+                                    self.backup_election_detected = True
+                                    self.deactivate_backup_mode()
+                                    break
+                    except Exception as e:
+                        logger.error(f"관리자 변경 감시 처리 중 오류: {e}")
+            
+            managers_key = f"{MANAGER_INFO_PREFIX}/{self.backup_for}/"
+            self.backup_watch_ids = self.etcd_client.watch_prefix(managers_key, on_manager_change)
+            if self.backup_watch_ids:
+                logger.info(f"클러스터 {self.backup_for}의 관리자 변경 감시 시작")
+            else:
+                logger.warning(f"클러스터 {self.backup_for}의 관리자 변경 감시 실패")
+        except Exception as e:
+            logger.error(f"백업 대상 클러스터 관리자 감시 설정 오류: {e}")
     
     def start(self):
         super().start()
@@ -230,6 +323,9 @@ class ManagementNode(Node):
         if self.backup_mode_active and self.backup_for:
             self.deactivate_backup_mode()
         try:
+            if self.backup_watch_ids:
+                self.etcd_client.cancel_watch(self.backup_watch_ids)
+                
             manager_event = {
                 "event_type": "MANAGER_STOPPED",
                 "node_id": self.id,
@@ -332,22 +428,41 @@ class ManagementNode(Node):
             try:
                 target_cluster_key = f"{CLUSTER_INFO_PREFIX}/{self.backup_for}/info"
                 target_cluster_info = self.etcd_client.get(target_cluster_key)
+                manager_active = False
                 current_time = time.time()
+                
+                # 클러스터 정보에서 매니저 확인
                 if target_cluster_info:
+                    manager_id = target_cluster_info.get("manager_id")
                     last_updated = target_cluster_info.get("last_updated", 0)
                     time_since_update = current_time - last_updated
-                    if time_since_update > BACKUP_ACTIVATION_TIMEOUT:
-                        logger.warning(f"Target cluster {self.backup_for} has not updated in {time_since_update:.1f} seconds")
-                        if not self.backup_mode_active:
-                            logger.info(f"Activating backup mode for cluster {self.backup_for}")
-                            self.activate_backup_mode()
-                    elif self.backup_mode_active:
-                        logger.info(f"Target cluster {self.backup_for} is back online, deactivating backup mode")
-                        self.deactivate_backup_mode()
-                else:
-                    if not self.backup_mode_active:
-                        logger.warning(f"No information for target cluster {self.backup_for}, activating backup mode")
-                        self.activate_backup_mode()
+                    
+                    # 매니저가 있고 최근에 업데이트 되었으면 활성 상태로 간주
+                    if manager_id and time_since_update < BACKUP_ACTIVATION_TIMEOUT:
+                        manager_active = True
+                        
+                # 기본 클러스터 정보가 없거나 관리자가 비활성 상태이면 직접 관리자 확인
+                if not manager_active:
+                    manager_results = self.etcd_client.get_prefix(f"{MANAGER_INFO_PREFIX}/{self.backup_for}/")
+                    for key, manager_data in manager_results:
+                        if "/events/" not in key and "temp_" not in key:
+                            last_updated = manager_data.get("last_updated", 0)
+                            time_since_update = current_time - last_updated
+                            status = manager_data.get("status", "UNKNOWN")
+                            
+                            if status == "ACTIVE" and time_since_update < BACKUP_ACTIVATION_TIMEOUT:
+                                manager_active = True
+                                break
+                
+                # 관리자가 비활성 상태이면 백업 모드 활성화
+                if not manager_active and not self.backup_mode_active:
+                    logger.warning(f"클러스터 {self.backup_for}의 관리자가 비활성 상태입니다. 백업 모드 활성화")
+                    self.activate_backup_mode()
+                # 관리자가 활성 상태이고 백업 모드가 활성화된 상태면 백업 모드 비활성화
+                elif manager_active and self.backup_mode_active:
+                    logger.info(f"클러스터 {self.backup_for}의 관리자가 활성 상태로 돌아왔습니다. 백업 모드 비활성화")
+                    self.deactivate_backup_mode()
+                
                 if not self.stop_event.wait(3.0):
                     continue
                 else:
@@ -383,7 +498,10 @@ class ManagementNode(Node):
             }
             self.etcd_client.put(event_key, event_data)
             self.backup_mode_active = True
+            self.backup_election_detected = False
             logger.info(f"Backup mode activated for cluster {self.backup_for} by node {self.id}")
+            
+            # 임시 관리자로 자신을 등록
             temp_manager_key = f"{MANAGER_INFO_PREFIX}/{self.backup_for}/temp_{self.id}"
             temp_manager_info = {
                 "node_id": self.id,
@@ -396,8 +514,26 @@ class ManagementNode(Node):
                 "last_updated": time.time()
             }
             self.etcd_client.put(temp_manager_key, temp_manager_info)
+            
+            # 백업 대상 클러스터의 참여 노드들에게 선출 이벤트 트리거
+            self.trigger_election_in_target_cluster()
         except Exception as e:
             logger.error(f"Error activating backup mode: {e}")
+    
+    def trigger_election_in_target_cluster(self):
+        """백업 대상 클러스터의 참여 노드들에게 선출 프로세스 시작을 알림"""
+        try:
+            election_trigger_key = f"{MANAGER_INFO_PREFIX}/{self.backup_for}/election_trigger"
+            election_data = {
+                "trigger_node_id": self.id,
+                "trigger_cluster_id": self.cluster_id,
+                "timestamp": time.time(),
+                "status": "TRIGGERED"
+            }
+            self.etcd_client.put(election_trigger_key, election_data)
+            logger.info(f"Election triggered in cluster {self.backup_for} by backup manager {self.id}")
+        except Exception as e:
+            logger.error(f"Error triggering election in target cluster: {e}")
     
     def deactivate_backup_mode(self):
         if not self.backup_mode_active or not self.backup_for:
@@ -410,6 +546,7 @@ class ManagementNode(Node):
                 "backup_for": self.backup_for,
                 "status": "STANDBY",
                 "deactivated_at": time.time(),
+                "election_detected": self.backup_election_detected,
                 "last_updated": time.time()
             }
             self.etcd_client.put(backup_key, backup_info)
@@ -419,11 +556,15 @@ class ManagementNode(Node):
                 "node_id": self.id,
                 "cluster_id": self.cluster_id,
                 "backup_for": self.backup_for,
+                "election_detected": self.backup_election_detected,
                 "timestamp": time.time()
             }
             self.etcd_client.put(event_key, event_data)
+            
+            # 임시 관리자 역할 제거
             temp_manager_key = f"{MANAGER_INFO_PREFIX}/{self.backup_for}/temp_{self.id}"
             self.etcd_client.delete(temp_manager_key)
+            
             self.backup_mode_active = False
             logger.info(f"Backup mode deactivated for cluster {self.backup_for} by node {self.id}")
         except Exception as e:
@@ -433,272 +574,333 @@ class ParticipantNode(Node):
     """P2P 참여 노드 클래스"""
     def __init__(self, node_id, cluster_id, etcd_endpoints=None, backup_etcd_endpoints=None):
         super().__init__(node_id, cluster_id, etcd_endpoints, backup_etcd_endpoints)
-        self.type = "PARTICIPANT"  # 유형 명시적 설정
+        self.type = "PARTICIPANT"
+        self.metadata["type"] = "PARTICIPANT"
         self.manager_id = None
         self.manager_connection = None
         self.temp_manager_id = None
         self.temp_manager_connection = None
         self.manager_watch_ids = None
-        self.promotion_check_interval = 2.0  # 2초마다 승격 확인
-        self.promotion_thread = None
-        self.election_watch_ids = None
+        self.election_thread = None
+        self.election_in_progress = False
+        self.last_manager_update = 0
+        self.manager_miss_count = 0
+        self.election_trigger_watch = None
     
     def start(self):
         super().start()
         self.find_manager()
         self.watch_manager_changes()
-        
-        # 승격 확인 스레드 시작
-        self.promotion_thread = threading.Thread(target=self.promotion_check_loop)
-        self.promotion_thread.daemon = True
-        self.promotion_thread.start()
-        
-        # 선출 이벤트 감시
-        self.watch_election_events()
-        
+        self.watch_election_trigger()
         logger.info(f"Participant node {self.id} is running in cluster {self.cluster_id}")
     
     def stop(self):
         if self.manager_watch_ids:
             self.etcd_client.cancel_watch(self.manager_watch_ids)
-        if self.election_watch_ids:
-            self.etcd_client.cancel_watch(self.election_watch_ids)
+        if self.election_trigger_watch:
+            self.etcd_client.cancel_watch(self.election_trigger_watch)
         super().stop()
-    
-    def log_detailed_status(self):
-        """현재 노드의 상세 상태 및 이벤트 정보 로깅"""
-        logger.info(f"=== 노드 {self.id} 상세 상태 ===")
-        logger.info(f"유형: {self.type}, 클러스터: {self.cluster_id}, 상태: {self.status}")
-        
-        # 현재 관리자 정보
-        logger.info(f"현재 관리자: {self.manager_id}, 임시 관리자: {self.temp_manager_id}")
-        
-        # 선출 정보 확인
-        try:
-            election_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/election"
-            election_data = self.etcd_client.get(election_key)
-            logger.info(f"선출 정보: {election_data}")
-        except Exception as e:
-            logger.info(f"선출 정보 조회 실패: {e}")
-        
-        # 승격 정보 확인
-        try:
-            promotion_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/promoted_manager"
-            promotion_data = self.etcd_client.get(promotion_key)
-            logger.info(f"승격 정보: {promotion_data}")
-        except Exception as e:
-            logger.info(f"승격 정보 조회 실패: {e}")
-        
-        # 클러스터 정보 확인
-        try:
-            cluster_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/info"
-            cluster_info = self.etcd_client.get(cluster_key)
-            logger.info(f"클러스터 정보: {cluster_info}")
-        except Exception as e:
-            logger.info(f"클러스터 정보 조회 실패: {e}")
-        
-        # 이벤트 정보 확인
-        try:
-            events_prefix = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/events/"
-            events = self.etcd_client.get_prefix(events_prefix)
-            event_count = len(events)
-            recent_events = events[-5:] if event_count > 5 else events
-            logger.info(f"최근 이벤트 ({event_count}개 중 {len(recent_events)}개): {recent_events}")
-        except Exception as e:
-            logger.info(f"이벤트 정보 조회 실패: {e}")
-    
-    def watch_election_events(self):
-        """선출 이벤트 감시"""
-        try:
-            events_prefix = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/events/"
-            
-            def on_election_event(event):
-                try:
-                    key = event[1].key.decode('utf-8')
-                    logger.info(f"선출 이벤트 감지: {key}")
-                    
-                    value_bytes = event[0]
-                    if not value_bytes:
-                        return
-                        
-                    value = json.loads(value_bytes.decode('utf-8'))
-                    event_type = value.get("event_type")
-                    
-                    if event_type == "MANAGER_ELECTION_NEEDED":
-                        logger.info(f"관리자 선출 요청 이벤트 감지: {key}")
-                        # 즉시 승격 확인
-                        self.check_promotion_status()
-                        # 선출 참여
-                        self.participate_in_election()
-                    elif event_type == "DIRECT_PROMOTION_REQUEST" and value.get("elected_node") == self.id:
-                        logger.info(f"직접 승격 요청 이벤트 감지: {key}")
-                        # 즉시 승격 시도
-                        self.check_promotion_status()
-                    elif event_type == "MANAGER_ELECTION_COMPLETED":
-                        logger.info(f"관리자 선출 완료 이벤트 감지: {key}")
-                        elected_node = value.get("elected_node")
-                        if elected_node == self.id:
-                            logger.info(f"노드 {self.id}가 새 관리자로 선출됨")
-                            # 즉시 승격 상태 확인
-                            self.check_promotion_status()
-                except Exception as e:
-                    logger.error(f"선출 이벤트 처리 오류: {e}")
-            
-            # 이벤트 감시 설정
-            self.election_watch_ids = self.etcd_client.watch_prefix(events_prefix, on_election_event)
-            if not self.election_watch_ids:
-                logger.warning("Failed to set up watch for election events")
-        except Exception as e:
-            logger.error(f"Error setting up watch for election events: {e}")
-    
-    def participate_in_election(self):
-        """선출 과정에 참여"""
-        try:
-            # 현재 노드가 활성 상태인지 확인
-            if self.status != "ACTIVE":
-                logger.info(f"노드 {self.id}가 활성 상태가 아니므로 선출에 참여하지 않음")
-                return False
-            
-            logger.info(f"노드 {self.id}가 선출 과정 참여 시도")
-            self.log_detailed_status()
-            
-            # 이미 후보로 등록되어 있는지 확인
-            election_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/election"
-            election_data = self.etcd_client.get(election_key)
-            
-            if election_data:
-                logger.info(f"현재 선출 정보: {election_data}")
-                
-                if election_data.get("elected_node") == self.id:
-                    logger.info(f"노드 {self.id}가 이미 선출 후보로 등록됨")
-                    # 승격 상태 바로 확인하여 처리
-                    self.check_promotion_status()
-                    return True
-                
-                # 마지막 선출 시간 확인
-                election_time = election_data.get("election_time", 0)
-                current_time = time.time()
-                elapsed_time = current_time - election_time
-                
-                if elapsed_time > 60.0:  # 60초 이상 경과했으면 선출 정보 갱신 시도
-                    logger.info(f"기존 선출 정보가 {elapsed_time:.1f}초 경과로 오래됨, 새로 선출 시도")
-                    
-                    # 새 선출 정보 등록
-                    new_election_data = {
-                        "elected_node": self.id,
-                        "election_time": current_time,
-                        "status": "PENDING"
-                    }
-                    self.etcd_client.put(election_key, new_election_data)
-                    logger.info(f"노드 {self.id}가 새 선출 정보 등록: {new_election_data}")
-                    
-                    # 승격 정보도 갱신
-                    promotion_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/promoted_manager"
-                    promotion_data = {
-                        "node_id": self.id,
-                        "elected_at": current_time,
-                        "status": "ELECTED"
-                    }
-                    self.etcd_client.put(promotion_key, promotion_data)
-                    logger.info(f"노드 {self.id}가 새 승격 정보 등록: {promotion_data}")
-                    
-                    # 승격 상태 즉시 확인
-                    self.check_promotion_status()
-                    return True
-            else:
-                # 현재 선출 정보가 없으면 새로 등록
-                logger.info(f"현재 선출 정보 없음, 노드 {self.id}가 선출 후보로 등록")
-                
-                # 현재 시간 기록
-                current_time = time.time()
-                
-                # 선출 정보 등록
-                new_election_data = {
-                    "elected_node": self.id,
-                    "election_time": current_time,
-                    "status": "PENDING"
-                }
-                self.etcd_client.put(election_key, new_election_data)
-                logger.info(f"노드 {self.id}가 선출 정보 등록: {new_election_data}")
-                
-                # 승격 정보도 등록
-                promotion_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/promoted_manager"
-                promotion_data = {
-                    "node_id": self.id,
-                    "elected_at": current_time,
-                    "status": "ELECTED"
-                }
-                self.etcd_client.put(promotion_key, promotion_data)
-                logger.info(f"노드 {self.id}가 승격 정보 등록: {promotion_data}")
-                
-                # 승격 상태 즉시 확인
-                self.check_promotion_status()
-                return True
-        except Exception as e:
-            logger.error(f"선출 참여 중 오류: {e}")
-        return False
     
     def find_manager(self):
         try:
             cluster_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/info"
             cluster_info = self.etcd_client.get(cluster_key)
             if cluster_info and "manager_id" in cluster_info:
-                manager_id = cluster_info["manager_id"]
-                # 관리자가 자기 자신인지 확인 (이미 승격된 경우)
-                if manager_id == self.id:
-                    logger.info(f"이 노드가 이미 관리자로 등록됨: {self.id}")
-                    # 승격 확인
-                    self.check_promotion_status()
-                    return
-                    
-                self.manager_id = manager_id
+                self.manager_id = cluster_info["manager_id"]
                 logger.info(f"Found primary manager: {self.manager_id}")
                 self.connect_to_manager()
+                self.last_manager_update = time.time()
+                self.manager_miss_count = 0
             else:
                 manager_results = self.etcd_client.get_prefix(f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/")
                 primary_managers = []
                 temp_managers = []
-                for key, manager_data in manager_results:
-                    # 이벤트나 임시 관리자 정보 제외
-                    if "events/" not in key and "temp_" not in key and "notifications/" not in key:
-                        node_id = manager_data.get("node_id", "")
-                        if node_id == self.id:
-                            # 자기 자신이 관리자로 등록되어 있으면 승격 확인
-                            logger.info(f"이 노드가 이미 관리자로 등록됨: {self.id}")
-                            self.check_promotion_status()
-                            return
-                        if manager_data.get("is_temporary", False):
-                            temp_managers.append(manager_data)
-                        elif manager_data.get("is_primary", False):
-                            primary_managers.append(manager_data)
-                
-                # 임시 관리자 확인            
-                temp_manager_results = self.etcd_client.get_prefix(f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/temp_")
-                for key, temp_data in temp_manager_results:
-                    temp_managers.append(temp_data)
-                
+                for _, manager_data in manager_results:
+                    if manager_data.get("is_temporary", False):
+                        temp_managers.append(manager_data)
+                    elif manager_data.get("is_primary", False):
+                        primary_managers.append(manager_data)
                 if temp_managers:
                     temp_manager = max(temp_managers, key=lambda x: x.get("last_updated", 0))
                     self.temp_manager_id = temp_manager["node_id"]
                     logger.info(f"Found temporary manager: {self.temp_manager_id}")
                     self.connect_to_temp_manager()
+                    self.last_manager_update = time.time()
+                    self.manager_miss_count = 0
                 elif primary_managers:
                     primary_manager = max(primary_managers, key=lambda x: x.get("last_updated", 0))
                     self.manager_id = primary_manager["node_id"]
                     logger.info(f"Found primary manager: {self.manager_id}")
                     self.connect_to_manager()
+                    self.last_manager_update = time.time()
+                    self.manager_miss_count = 0
                 else:
                     logger.warning(f"No manager found for cluster {self.cluster_id}")
-                    
-                    # 관리자가 없는 경우 이 노드를 관리자로 자체 선출 시도
-                    promotion_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/promoted_manager"
-                    promotion_data = self.etcd_client.get(promotion_key)
-                    
-                    if promotion_data and promotion_data.get("node_id") == self.id:
-                        logger.info(f"관리자가 없고 이 노드({self.id})가 승격 대상으로 등록됨")
-                        self.check_promotion_status()
+                    # 관리자가 없으면 선출 절차 시작 여부 확인
+                    self.check_if_election_needed()
         except Exception as e:
             logger.error(f"Error finding manager: {e}")
+    
+    def check_if_election_needed(self):
+        """관리자가 없을 때 선출 절차가 필요한지 확인"""
+        if self.election_in_progress:
+            return
+            
+        current_time = time.time()
+        time_since_last_update = current_time - self.last_manager_update
+        
+        # 마지막 관리자 업데이트 후 일정 시간이 지났으면 선출 시작
+        if time_since_last_update > BACKUP_ACTIVATION_TIMEOUT:
+            # 이미 진행 중인 선출이 있는지 확인
+            election_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election"
+            election_info = self.etcd_client.get(election_key)
+            if election_info and current_time - election_info.get("timestamp", 0) < LEADER_ELECTION_MAX_TIMEOUT * 2:
+                # 다른 노드가 이미 선출을 시작했으면 참여만 함
+                logger.info(f"Election already in progress, joining: {election_info}")
+                self.join_election(election_info.get("election_id", "unknown"))
+            else:
+                # 새 선출 시작
+                logger.info(f"No active manager for {time_since_last_update:.1f}s, starting election")
+                self.start_election()
+    
+    def watch_election_trigger(self):
+        """백업 관리자가 트리거한 선출 이벤트 감시"""
+        try:
+            def on_election_trigger(event):
+                if event and event.events:
+                    for e in event.events:
+                        if e.type == "PUT":
+                            # 선출 트리거 이벤트 발생
+                            try:
+                                value = json.loads(e.value.decode('utf-8'))
+                                if value.get("status") == "TRIGGERED":
+                                    logger.info(f"Election trigger detected from backup manager")
+                                    if not self.election_in_progress:
+                                        self.start_election()
+                            except Exception as e:
+                                logger.error(f"Error processing election trigger: {e}")
+            
+            trigger_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election_trigger"
+            self.election_trigger_watch = self.etcd_client.watch(trigger_key, on_election_trigger)
+        except Exception as e:
+            logger.error(f"Error setting up election trigger watch: {e}")
+    
+    def start_election(self):
+        """관리자 선출 프로세스 시작"""
+        if self.election_in_progress:
+            return
+            
+        self.election_in_progress = True
+        election_id = f"election_{self.cluster_id}_{int(time.time())}_{self.id}"
+        
+        try:
+            # 선출 정보 등록
+            election_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election"
+            election_info = {
+                "election_id": election_id,
+                "initiator_id": self.id,
+                "cluster_id": self.cluster_id,
+                "status": "STARTED",
+                "timestamp": time.time()
+            }
+            self.etcd_client.put(election_key, election_info)
+            
+            # 자신의 투표 등록
+            vote_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election/votes/{self.id}"
+            vote_info = {
+                "node_id": self.id,
+                "election_id": election_id,
+                "vote_for": self.id,  # 자신에게 투표
+                "timestamp": time.time()
+            }
+            self.etcd_client.put(vote_key, vote_info)
+            
+            # 선출 결과 감시 스레드 시작
+            self.election_thread = threading.Thread(target=self.election_process, args=(election_id,))
+            self.election_thread.daemon = True
+            self.election_thread.start()
+            
+            logger.info(f"Node {self.id} started election process with ID {election_id}")
+        except Exception as e:
+            logger.error(f"Error starting election: {e}")
+            self.election_in_progress = False
+    
+    def join_election(self, election_id):
+        """진행 중인 선출에 참여"""
+        if self.election_in_progress:
+            return
+            
+        self.election_in_progress = True
+        
+        try:
+            # 자신의 투표 등록 (현재는 단순히 자신에게 투표)
+            vote_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election/votes/{self.id}"
+            vote_info = {
+                "node_id": self.id,
+                "election_id": election_id,
+                "vote_for": self.id,  # 자신에게 투표
+                "timestamp": time.time()
+            }
+            self.etcd_client.put(vote_key, vote_info)
+            
+            # 선출 결과 감시 스레드 시작
+            self.election_thread = threading.Thread(target=self.election_process, args=(election_id,))
+            self.election_thread.daemon = True
+            self.election_thread.start()
+            
+            logger.info(f"Node {self.id} joined election process with ID {election_id}")
+        except Exception as e:
+            logger.error(f"Error joining election: {e}")
+            self.election_in_progress = False
+    
+    def election_process(self, election_id):
+        """선출 프로세스 진행 및 결과 처리"""
+        try:
+            # 무작위 대기 시간 설정 (충돌 방지)
+            wait_time = random.uniform(LEADER_ELECTION_MIN_TIMEOUT, LEADER_ELECTION_MAX_TIMEOUT)
+            logger.info(f"Election waiting for {wait_time:.1f} seconds")
+            time.sleep(wait_time)
+            
+            # 모든 투표 수집
+            votes_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election/votes/"
+            votes_results = self.etcd_client.get_prefix(votes_key)
+            
+            votes = {}
+            for _, vote_data in votes_results:
+                if vote_data.get("election_id") == election_id:
+                    vote_for = vote_data.get("vote_for")
+                    if vote_for in votes:
+                        votes[vote_for] += 1
+                    else:
+                        votes[vote_for] = 1
+            
+            # 최다 득표자 결정
+            if votes:
+                winner_id = max(votes.items(), key=lambda x: x[1])[0]
+                vote_count = votes.get(winner_id, 0)
+                
+                logger.info(f"Election results: {votes}, winner: {winner_id} with {vote_count} votes")
+                
+                # 자신이 당선되면 관리자로 역할 변경
+                if winner_id == self.id:
+                    logger.info(f"Node {self.id} won election, becoming primary manager")
+                    
+                    # 선출 결과 업데이트
+                    election_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election"
+                    election_result = {
+                        "election_id": election_id,
+                        "winner_id": self.id,
+                        "votes": votes,
+                        "status": "COMPLETED",
+                        "timestamp": time.time()
+                    }
+                    self.etcd_client.put(election_key, election_result)
+                    
+                    # 관리자로 역할 변경
+                    self.change_role("MANAGER", is_primary=True)
+                    
+                    # 관리자 객체로 변환하여 초기화
+                    self.convert_to_manager()
+                else:
+                    logger.info(f"Election won by node {winner_id}")
+            else:
+                logger.warning("No votes collected during election")
+        except Exception as e:
+            logger.error(f"Error in election process: {e}")
+        finally:
+            self.election_in_progress = False
+    
+    def convert_to_manager(self):
+        """참여 노드를 관리 노드로 변환"""
+        try:
+            # 기존 상태 저장
+            node_id = self.id
+            cluster_id = self.cluster_id
+            etcd_endpoints = self.etcd_client.endpoints
+            backup_etcd_endpoints = self.etcd_client.backup_endpoints
+            
+            # 기존 노드 종료 (스레드 중지)
+            self.stop_event.set()
+            if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+                self.heartbeat_thread.join(timeout=1.0)
+            
+            # 관리 노드 기능 초기화
+            self.backup_mode_active = False
+            self.participant_nodes = {}
+            self.backup_check_thread = None
+            self.etcd_monitor_thread = None
+            self.discovery_thread = None
+            
+            # 백업 관리자로서의 역할 설정 (필요한 경우)
+            backup_for = CLUSTER_BACKUP_MAP.get(self.cluster_id)
+            
+            # 관리자 이벤트 등록
+            manager_event = {
+                "event_type": "PARTICIPANT_PROMOTED",
+                "node_id": self.id,
+                "cluster_id": self.cluster_id,
+                "is_primary": True,
+                "timestamp": time.time()
+            }
+            event_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/events/{int(time.time())}"
+            self.etcd_client.put(event_key, manager_event)
+            
+            # 관리자 정보 등록
+            manager_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/{self.id}"
+            manager_info = {
+                "node_id": self.id,
+                "cluster_id": self.cluster_id,
+                "is_primary": True,
+                "type": "MANAGER",
+                "status": "ACTIVE",
+                "promoted_from": "PARTICIPANT",
+                "last_updated": time.time()
+            }
+            self.etcd_client.put(manager_key, manager_info)
+            
+            # 클러스터 정보 업데이트
+            cluster_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/info"
+            cluster_info = {
+                "cluster_id": self.cluster_id,
+                "manager_id": self.id,
+                "is_primary": True,
+                "promoted": True,
+                "node_count": 0,
+                "last_updated": time.time()
+            }
+            self.etcd_client.put(cluster_key, cluster_info)
+            
+            # 백업이 설정된 경우 백업 역할 등록
+            if backup_for:
+                backup_key = f"{BACKUP_INFO_PREFIX}/{backup_for}/managers/{self.id}"
+                backup_info = {
+                    "node_id": self.id,
+                    "cluster_id": self.cluster_id,
+                    "backup_for": backup_for,
+                    "status": "STANDBY",
+                    "last_updated": time.time()
+                }
+                self.etcd_client.put(backup_key, backup_info)
+            
+            # 관리 노드 스레드 시작
+            self.stop_event.clear()
+            self.discovery_thread = threading.Thread(target=self.discovery_loop)
+            self.discovery_thread.daemon = True
+            self.discovery_thread.start()
+            
+            self.etcd_monitor_thread = threading.Thread(target=self.monitor_etcd_status)
+            self.etcd_monitor_thread.daemon = True
+            self.etcd_monitor_thread.start()
+            
+            if backup_for:
+                self.backup_check_thread = threading.Thread(target=self.backup_check_loop)
+                self.backup_check_thread.daemon = True
+                self.backup_check_thread.start()
+                self.watch_target_cluster_managers()
+            
+            logger.info(f"Node {self.id} successfully converted to primary manager")
+        except Exception as e:
+            logger.error(f"Error converting participant to manager: {e}")
     
     def connect_to_manager(self):
         if not self.manager_id:
@@ -728,300 +930,60 @@ class ParticipantNode(Node):
             def on_cluster_change(event):
                 logger.info("Cluster information changed, re-finding manager")
                 self.find_manager()
-                
-                # 클러스터 변경 시 승격 확인
-                self.check_promotion_status()
-                
             self.manager_watch_ids = self.etcd_client.watch_prefix(cluster_prefix, on_cluster_change)
             if not self.manager_watch_ids:
                 logger.warning("Failed to set up watch for manager changes")
         except Exception as e:
             logger.error(f"Error setting up watch for manager changes: {e}")
     
-    def promotion_check_loop(self):
-        """정기적으로 승격 상태 확인"""
-        while not self.stop_event.is_set():
-            try:
-                # 승격 상태 확인
-                self.check_promotion_status()
-                
-                if not self.stop_event.wait(self.promotion_check_interval):
-                    continue
-                else:
-                    break
-            except Exception as e:
-                logger.error(f"Error in promotion check loop: {e}")
-                if not self.stop_event.wait(1.0):
-                    continue
-                else:
-                    break
-    
-    def promote_to_manager(self):
-        """참여자 노드를 관리자 노드로 승격"""
-        logger.info(f"노드 {self.id}가 관리자로 승격 시도")
-        try:
-            # 기존 데이터는 유지
-            self.type = "MANAGER"  # 유형 명시적 설정
-            self.metadata["type"] = "MANAGER"
-            # 기본 관리자로 설정
-            self.is_primary = True
-            
-            # 기존 관리자 노드 정보 확인 및 삭제
-            try:
-                cluster_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/info"
-                cluster_info = self.etcd_client.get(cluster_key)
-                if cluster_info and "manager_id" in cluster_info:
-                    old_manager_id = cluster_info["manager_id"]
-                    if old_manager_id != self.id:
-                        # 기존 관리자의 상태 확인
-                        old_manager_key = f"{NODE_INFO_PREFIX}/{self.cluster_id}/{old_manager_id}"
-                        old_manager_data = self.etcd_client.get(old_manager_key)
-                        if old_manager_data and old_manager_data.get("status") != "ACTIVE":
-                            # 비활성 상태인 경우 관리자 정보 삭제
-                            old_manager_reg_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/{old_manager_id}"
-                            self.etcd_client.delete(old_manager_reg_key)
-                            logger.info(f"기존 관리자 {old_manager_id} 정보 삭제")
-            except Exception as e:
-                logger.error(f"기존 관리자 정보 처리 중 오류: {e}")
-            
-            # 관리자 정보 등록
-            manager_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/{self.id}"
-            manager_info = {
-                "node_id": self.id,
-                "cluster_id": self.cluster_id,
-                "is_primary": True,
-                "type": "MANAGER",
-                "status": self.status,
-                "last_updated": time.time(),
-                "promoted_at": time.time()
-            }
-            result = self.etcd_client.put(manager_key, manager_info)
-            logger.info(f"관리자 정보 등록 결과: {result}")
-            
-            # 클러스터 정보 업데이트
-            cluster_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/info"
-            cluster_info = {
-                "cluster_id": self.cluster_id,
-                "manager_id": self.id,
-                "is_primary": True,
-                "node_count": 0,
-                "last_updated": time.time()
-            }
-            result = self.etcd_client.put(cluster_key, cluster_info)
-            logger.info(f"클러스터 정보 업데이트 결과: {result}")
-            
-            # 이벤트 발행
-            event_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/events/{int(time.time())}"
-            event_data = {
-                "event_type": "PARTICIPANT_PROMOTED_TO_MANAGER",
-                "node_id": self.id,
-                "cluster_id": self.cluster_id,
-                "timestamp": time.time()
-            }
-            self.etcd_client.put(event_key, event_data)
-            
-            # 승격 상태 업데이트
-            promotion_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/promoted_manager"
-            promotion_data = {
-                "node_id": self.id,
-                "promoted_at": time.time(),
-                "status": "PROMOTED"
-            }
-            result = self.etcd_client.put(promotion_key, promotion_data)
-            logger.info(f"승격 상태 업데이트 결과: {result}")
-            
-            # 백업 클러스터에 알림
-            backup_cluster_id = CLUSTER_BACKUP_MAP.get(self.cluster_id)
-            if backup_cluster_id:
-                notification_key = f"{MANAGER_INFO_PREFIX}/{backup_cluster_id}/notifications/{int(time.time())}"
-                notification_data = {
-                    "event_type": "PRIMARY_MANAGER_PROMOTED",
-                    "node_id": self.id,
-                    "cluster_id": self.cluster_id,
-                    "timestamp": time.time()
-                }
-                self.etcd_client.put(notification_key, notification_data)
-            
-            logger.info(f"노드 {self.id}가 관리자로 성공적으로 승격됨")
-            return True
-        except Exception as e:
-            logger.error(f"관리자 승격 중 오류: {e}")
-            return False
-    
-    def check_promotion_status(self):
-        """선출 상태 확인 및 관리자로 승격 처리"""
-        try:
-            # 로그 상세화
-            self.log_detailed_status()
-            
-            # 1. 선출 정보 확인
-            election_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/election"
-            election_data = self.etcd_client.get(election_key)
-            
-            # 2. 승격 정보 확인
-            promotion_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/promoted_manager"
-            promotion_data = self.etcd_client.get(promotion_key)
-            
-            # 3. 클러스터 정보 확인
-            cluster_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/info"
-            cluster_info = self.etcd_client.get(cluster_key)
-            
-            # 후보 노드 선출 현황 로깅
-            if election_data:
-                logger.info(f"선출 정보: {election_data}")
-            
-            # 이미 클러스터 정보에 관리자로 등록되어 있는지 확인
-            if cluster_info and cluster_info.get("manager_id") == self.id:
-                if self.type != "MANAGER":
-                    logger.info(f"노드 {self.id}가 이미 클러스터에 관리자로 등록되어 있음, 즉시 승격")
-                    # 관리자로 승격
-                    return self.convert_to_manager()
-            
-            # 두 정보 중 하나라도 있고 자신이 대상이면 처리
-            if election_data and election_data.get("elected_node") == self.id:
-                logger.info(f"노드 {self.id}가 선출 대상으로 확인됨: status={election_data.get('status', 'unknown')}")
-                
-                if election_data.get("status") == "PENDING":
-                    # 대기 상태면 승격 진행
-                    logger.info(f"노드 {self.id}가 관리자 승격 대기 상태, 승격 진행")
-                    
-                    # 승격 정보 갱신
-                    if not promotion_data:
-                        # 승격 정보가 없으면 새로 생성
-                        promotion_data = {
-                            "node_id": self.id,
-                            "elected_at": time.time(),
-                            "status": "ELECTED"
-                        }
-                        result = self.etcd_client.put(promotion_key, promotion_data)
-                        logger.info(f"승격 정보 생성 결과: {result}")
-            
-            if promotion_data and promotion_data.get("node_id") == self.id:
-                status = promotion_data.get("status", "")
-                logger.info(f"노드 {self.id}의 승격 상태: {status}")
-                
-                if status == "ELECTED" or status == "PENDING":
-                    logger.info(f"노드 {self.id}가 새 관리자로 선출됨, 승격 진행")
-                    
-                    # 관리자로 승격 진행
-                    return self.convert_to_manager()
-        except Exception as e:
-            logger.error(f"승격 상태 확인 중 오류: {e}")
-        return False
-    
-    def convert_to_manager(self):
-        """관리자로 변환 (새로운 패턴)"""
-        logger.info(f"노드 {self.id}를 관리자로 변환 시작")
-        
-        try:
-            # 1. 관리자로 승격 처리
-            success = self.promote_to_manager()
-            if not success:
-                logger.error(f"노드 {self.id}의 관리자 승격 실패")
-                return False
-            
-            # 2. 필요한 ManagementNode 속성 추가
-            logger.info(f"노드 {self.id}에 ManagementNode 속성 추가 중")
-            self.is_primary = True
-            self.participant_nodes = {}
-            self.backup_mode_active = False
-            self.backup_check_thread = None
-            self.etcd_monitor_thread = None
-            self.discovery_thread = None
-            self.backup_for = CLUSTER_BACKUP_MAP.get(self.cluster_id)
-            
-            # 3. ManagementNode 메서드를 현재 인스턴스에 동적으로 추가
-            logger.info(f"노드 {self.id}에 ManagementNode 메서드 추가 중")
-            # ManagementNode 인스턴스 생성 (메서드 복사용)
-            management_node = ManagementNode(
-                self.id, 
-                self.cluster_id, 
-                is_primary=True,
-                etcd_endpoints=self.etcd_client.endpoints,
-                backup_etcd_endpoints=None
-            )
-            
-            # 중요 메서드들을 현재 인스턴스에 동적으로 추가
-            import types
-            self.initialize = types.MethodType(management_node.initialize, self)
-            self.register_as_manager = types.MethodType(management_node.register_as_manager, self)
-            self.setup_backup_role = types.MethodType(management_node.setup_backup_role, self)
-            self.discovery_loop = types.MethodType(management_node.discovery_loop, self)
-            self.update_cluster_info = types.MethodType(management_node.update_cluster_info, self)
-            self.monitor_etcd_status = types.MethodType(management_node.monitor_etcd_status, self)
-            self.backup_check_loop = types.MethodType(management_node.backup_check_loop, self)
-            self.activate_backup_mode = types.MethodType(management_node.activate_backup_mode, self)
-            self.deactivate_backup_mode = types.MethodType(management_node.deactivate_backup_mode, self)
-            self.detect_primary_manager_recovery = types.MethodType(management_node.detect_primary_manager_recovery, self)
-            
-            # 4. 타입 변경 및 메타데이터 업데이트
-            self.type = "MANAGER"
-            self.metadata["type"] = "MANAGER"
-            self.register_to_etcd()
-            
-            # 5. 관리자 초기화
-            logger.info(f"노드 {self.id}의 관리자 초기화 시작")
-            self.initialize()
-            
-            # 6. 추가 스레드 시작
-            logger.info(f"노드 {self.id}의 관리자 스레드 시작")
-            self.discovery_thread = threading.Thread(target=self.discovery_loop)
-            self.discovery_thread.daemon = True
-            self.discovery_thread.start()
-            
-            self.etcd_monitor_thread = threading.Thread(target=self.monitor_etcd_status)
-            self.etcd_monitor_thread.daemon = True
-            self.etcd_monitor_thread.start()
-            
-            if self.backup_for:
-                self.setup_backup_role()
-                self.backup_check_thread = threading.Thread(target=self.backup_check_loop)
-                self.backup_check_thread.daemon = True
-                self.backup_check_thread.start()
-            
-            # 7. 백업 관리자에게 알림
-            threading.Thread(target=self.notify_backup_managers).start()
-            
-            logger.info(f"노드 {self.id}가 성공적으로 관리자로 변환됨")
-            return True
-        except Exception as e:
-            logger.error(f"관리자 변환 중 오류: {e}")
-            return False
-    
-    def notify_backup_managers(self):
-        """백업 관리자에게 승격 알림"""
-        try:
-            # 백업 클러스터 ID 찾기
-            backup_cluster_id = CLUSTER_BACKUP_MAP.get(self.cluster_id)
-            if not backup_cluster_id:
-                return
-                
-            # 백업 관리자 정보 찾기
-            backup_key = f"{BACKUP_INFO_PREFIX}/{self.cluster_id}/managers/"
-            backup_results = self.etcd_client.get_prefix(backup_key)
-            
-            for key, backup_data in backup_results:
-                backup_node_id = backup_data.get("node_id")
-                backup_status = backup_data.get("status")
-                
-                if backup_status == "ACTIVE":
-                    # 활성 백업 관리자에게 알림
-                    logger.info(f"백업 관리자 {backup_node_id}에게 승격 알림 전송")
-                    
-                    notification_key = f"{BACKUP_INFO_PREFIX}/{self.cluster_id}/notifications/{int(time.time())}"
-                    notification_data = {
-                        "event_type": "PRIMARY_MANAGER_PROMOTED",
-                        "primary_node_id": self.id,
-                        "cluster_id": self.cluster_id,
-                        "backup_node_id": backup_node_id,
-                        "timestamp": time.time()
-                    }
-                    self.etcd_client.put(notification_key, notification_data)
-        except Exception as e:
-            logger.error(f"백업 관리자 알림 중 오류: {e}")
-    
     def check_cluster_status(self):
         try:
+            current_time = time.time()
+            manager_active = False
+            
+            # 기본 관리자 상태 확인
+            if self.manager_id:
+                manager_key = f"{NODE_INFO_PREFIX}/{self.cluster_id}/{self.manager_id}"
+                manager_info = self.etcd_client.get(manager_key)
+                
+                if manager_info and manager_info.get("status") == "ACTIVE":
+                    last_updated = manager_info.get("last_updated", 0)
+                    time_since_update = current_time - last_updated
+                    
+                    if time_since_update < BACKUP_ACTIVATION_TIMEOUT:
+                        manager_active = True
+                        self.last_manager_update = current_time
+                        self.manager_miss_count = 0
+                    else:
+                        self.manager_miss_count += 1
+                else:
+                    self.manager_miss_count += 1
+            # 임시 관리자 상태 확인
+            elif self.temp_manager_id:
+                temp_manager_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/temp_{self.temp_manager_id}"
+                temp_manager_info = self.etcd_client.get(temp_manager_key)
+                
+                if temp_manager_info:
+                    last_updated = temp_manager_info.get("last_updated", 0)
+                    time_since_update = current_time - last_updated
+                    
+                    if time_since_update < BACKUP_ACTIVATION_TIMEOUT:
+                        manager_active = True
+                        self.last_manager_update = current_time
+                        self.manager_miss_count = 0
+                    else:
+                        self.manager_miss_count += 1
+                else:
+                    self.manager_miss_count += 1
+            else:
+                self.manager_miss_count += 1
+            
+            # 관리자 부재 시 선출 검토
+            if self.manager_miss_count >= MAX_HEARTBEAT_MISS and not self.election_in_progress:
+                logger.warning(f"Manager hasn't responded for {self.manager_miss_count} checks")
+                self.check_if_election_needed()
+            
+            # 연결 확인
             if self.manager_id and self.manager_id not in self.connections:
                 logger.warning(f"Connection to manager {self.manager_id} lost, attempting to reconnect")
                 self.connect_to_manager()
@@ -1031,16 +993,6 @@ class ParticipantNode(Node):
             if not self.manager_id and not self.temp_manager_id:
                 logger.warning("No manager connection, attempting to find manager")
                 self.find_manager()
-
-                # 관리자가 없는 상태가 지속되면 선출 과정 시작
-                if not self.manager_id and not self.temp_manager_id:
-                    # 선출 정보 확인
-                    election_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/election"
-                    election_data = self.etcd_client.get(election_key)
-                    
-                    # 현재 진행 중인 선출이 없으면 자신을 후보로 등록
-                    if not election_data:
-                        logger.info("관리자 없음 상태 감지, 선출 과정 시작")
-                        self.participate_in_election()
+                
         except Exception as e:
             logger.error(f"Error in check_cluster_status: {e}")
