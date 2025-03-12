@@ -523,14 +523,41 @@ class ManagementNode(Node):
     def trigger_election_in_target_cluster(self):
         """백업 대상 클러스터의 참여 노드들에게 선출 프로세스 시작을 알림"""
         try:
+            # 명확한 선출 트리거 메시지 생성
             election_trigger_key = f"{MANAGER_INFO_PREFIX}/{self.backup_for}/election_trigger"
             election_data = {
                 "trigger_node_id": self.id,
                 "trigger_cluster_id": self.cluster_id,
                 "timestamp": time.time(),
-                "status": "TRIGGERED"
+                "status": "TRIGGERED",
+                "force": True
             }
             self.etcd_client.put(election_trigger_key, election_data)
+            
+            # 모든 참여 노드에 직접 메시지 전송
+            try:
+                nodes = self.etcd_client.get_prefix(f"{NODE_INFO_PREFIX}/{self.backup_for}/")
+                participant_nodes = []
+                
+                for key, node_data in nodes:
+                    if node_data.get("type") == "PARTICIPANT" and node_data.get("status") == "ACTIVE":
+                        participant_nodes.append(node_data.get("node_id"))
+                
+                logger.info(f"백업 관리자가 클러스터 {self.backup_for}의 참여 노드 {len(participant_nodes)}개에 선출 명령 전송")
+                
+                # 각 참여 노드에 대한 직접 트리거 메시지 생성
+                for node_id in participant_nodes:
+                    node_trigger_key = f"{MANAGER_INFO_PREFIX}/{self.backup_for}/election_trigger/node_{node_id}"
+                    node_trigger_data = {
+                        "target_node": node_id,
+                        "timestamp": time.time(),
+                        "action": "START_ELECTION",
+                        "backup_manager": self.id
+                    }
+                    self.etcd_client.put(node_trigger_key, node_trigger_data)
+            except Exception as e:
+                logger.error(f"참여 노드 목록 조회 중 오류: {e}")
+            
             logger.info(f"Election triggered in cluster {self.backup_for} by backup manager {self.id}")
         except Exception as e:
             logger.error(f"Error triggering election in target cluster: {e}")
@@ -649,8 +676,28 @@ class ParticipantNode(Node):
         current_time = time.time()
         time_since_last_update = current_time - self.last_manager_update
         
-        # 마지막 관리자 업데이트 후 일정 시간이 지났으면 선출 시작
-        if time_since_last_update > BACKUP_ACTIVATION_TIMEOUT:
+        # 마지막 관리자 업데이트 후 일정 시간이 지났거나 manager_miss_count가 임계값을 초과했으면 선출 시작
+        if time_since_last_update > BACKUP_ACTIVATION_TIMEOUT or self.manager_miss_count >= MAX_HEARTBEAT_MISS:
+            # 선출 트리거가 있는지 확인
+            election_trigger_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election_trigger"
+            election_trigger = self.etcd_client.get(election_trigger_key)
+            
+            if election_trigger and election_trigger.get("status") == "TRIGGERED":
+                logger.info(f"선출 트리거 감지: 백업 관리자 {election_trigger.get('trigger_node_id')}가 선출 요청")
+                self.start_election()
+                return
+            
+            # 내 노드에 대한 직접적인 선출 요청이 있는지 확인
+            my_trigger_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election_trigger/node_{self.id}"
+            my_trigger = self.etcd_client.get(my_trigger_key)
+            
+            if my_trigger and my_trigger.get("action") == "START_ELECTION":
+                logger.info(f"내 노드에 대한 직접 선출 요청 감지, 백업 관리자: {my_trigger.get('backup_manager')}")
+                self.start_election()
+                # 처리 완료된 트리거 삭제
+                self.etcd_client.delete(my_trigger_key)
+                return
+            
             # 이미 진행 중인 선출이 있는지 확인
             election_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election"
             election_info = self.etcd_client.get(election_key)
@@ -660,7 +707,7 @@ class ParticipantNode(Node):
                 self.join_election(election_info.get("election_id", "unknown"))
             else:
                 # 새 선출 시작
-                logger.info(f"No active manager for {time_since_last_update:.1f}s, starting election")
+                logger.info(f"No active manager for {time_since_last_update:.1f}s, starting election (missed count: {self.manager_miss_count})")
                 self.start_election()
     
     def watch_election_trigger(self):
@@ -672,16 +719,34 @@ class ParticipantNode(Node):
                         if e.type == "PUT":
                             # 선출 트리거 이벤트 발생
                             try:
+                                key = e.key.decode('utf-8')
                                 value = json.loads(e.value.decode('utf-8'))
-                                if value.get("status") == "TRIGGERED":
-                                    logger.info(f"Election trigger detected from backup manager")
+                                
+                                # 전체 클러스터에 대한 트리거 확인
+                                if "/node_" not in key and value.get("status") == "TRIGGERED":
+                                    logger.info(f"선출 트리거 감지 from {value.get('trigger_node_id')}")
                                     if not self.election_in_progress:
                                         self.start_election()
+                                # 이 노드에 대한 직접 트리거 확인
+                                elif f"node_{self.id}" in key and value.get("action") == "START_ELECTION":
+                                    logger.info(f"내 노드에 대한 직접 선출 요청 감지: {value}")
+                                    if not self.election_in_progress:
+                                        self.start_election()
+                                        # 처리 완료된 트리거 삭제
+                                        self.etcd_client.delete(key)
                             except Exception as e:
                                 logger.error(f"Error processing election trigger: {e}")
             
+            # 전체 트리거 감시
             trigger_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election_trigger"
-            self.election_trigger_watch = self.etcd_client.watch(trigger_key, on_election_trigger)
+            global_watch = self.etcd_client.watch(trigger_key, on_election_trigger)
+            
+            # 이 노드에 대한 직접 트리거 감시
+            node_trigger_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election_trigger/node_{self.id}"
+            node_watch = self.etcd_client.watch(node_trigger_key, on_election_trigger)
+            
+            # 두 감시를 하나의 리스트로 결합
+            self.election_trigger_watch = [global_watch, node_watch] if global_watch and node_watch else global_watch or node_watch
         except Exception as e:
             logger.error(f"Error setting up election trigger watch: {e}")
     
@@ -870,6 +935,13 @@ class ParticipantNode(Node):
             }
             self.etcd_client.put(cluster_key, cluster_info)
             
+            # 노드 정보 업데이트
+            node_key = f"{NODE_INFO_PREFIX}/{self.cluster_id}/{self.id}"
+            self.metadata["type"] = "MANAGER"
+            self.metadata["is_primary"] = True
+            self.metadata["last_updated"] = time.time()
+            self.etcd_client.put(node_key, self.metadata)
+            
             # 백업이 설정된 경우 백업 역할 등록
             if backup_for:
                 backup_key = f"{BACKUP_INFO_PREFIX}/{backup_for}/managers/{self.id}"
@@ -956,8 +1028,10 @@ class ParticipantNode(Node):
                         self.manager_miss_count = 0
                     else:
                         self.manager_miss_count += 1
+                        logger.warning(f"관리자 {self.manager_id} 응답 없음: {time_since_update:.1f}초 지남, 누적 miss: {self.manager_miss_count}")
                 else:
                     self.manager_miss_count += 1
+                    logger.warning(f"관리자 {self.manager_id} 비활성 상태, 누적 miss: {self.manager_miss_count}")
             # 임시 관리자 상태 확인
             elif self.temp_manager_id:
                 temp_manager_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/temp_{self.temp_manager_id}"
@@ -973,14 +1047,18 @@ class ParticipantNode(Node):
                         self.manager_miss_count = 0
                     else:
                         self.manager_miss_count += 1
+                        logger.warning(f"임시 관리자 {self.temp_manager_id} 응답 없음: {time_since_update:.1f}초 지남, 누적 miss: {self.manager_miss_count}")
                 else:
                     self.manager_miss_count += 1
+                    logger.warning(f"임시 관리자 정보가 없음, 누적 miss: {self.manager_miss_count}")
             else:
                 self.manager_miss_count += 1
+                logger.warning(f"관리자 없음, 누적 miss: {self.manager_miss_count}")
             
             # 관리자 부재 시 선출 검토
+            # MAX_HEARTBEAT_MISS 이상 누적되면 check_if_election_needed에서 선출 시작
             if self.manager_miss_count >= MAX_HEARTBEAT_MISS and not self.election_in_progress:
-                logger.warning(f"Manager hasn't responded for {self.manager_miss_count} checks")
+                logger.warning(f"관리자 장애 감지: {self.manager_miss_count}번 연속 미응답")
                 self.check_if_election_needed()
             
             # 연결 확인

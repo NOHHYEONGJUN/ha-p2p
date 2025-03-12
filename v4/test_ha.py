@@ -150,7 +150,42 @@ class HATest:
                 cluster_key = f"{CLUSTER_INFO_PREFIX}/{cluster_id}/info"
                 cluster_info = self.etcd_client.get(cluster_key)
                 
-                if cluster_info and "manager_id" in cluster_info:
+                # ETCD에서 직접 관리자 정보 찾기
+                manager_results = self.etcd_client.get_prefix(f"{MANAGER_INFO_PREFIX}/{cluster_id}/")
+                active_managers = []
+                
+                for key, manager_data in manager_results:
+                    if "events/" not in key and "temp_" not in key and "election" not in key:
+                        manager_id = manager_data.get("node_id", "unknown")
+                        is_primary = manager_data.get("is_primary", False)
+                        status = manager_data.get("status", "UNKNOWN")
+                        last_updated = manager_data.get("last_updated", 0)
+                        time_diff = current_time - last_updated
+                        
+                        # 최근에 업데이트된 활성 상태의 관리자 찾기
+                        if status == "ACTIVE" and time_diff < max_inactive_time:
+                            active_managers.append((manager_id, is_primary, time_diff, manager_data))
+                
+                # 가장 최근에 업데이트된 활성 관리자 찾기
+                if active_managers:
+                    # 프라이머리 관리자를 우선 선택, 없으면 가장 최근에 업데이트된 관리자 선택
+                    primary_managers = [m for m in active_managers if m[1]]
+                    if primary_managers:
+                        selected = min(primary_managers, key=lambda x: x[2])
+                    else:
+                        selected = min(active_managers, key=lambda x: x[2])
+                    
+                    manager_id, is_primary, time_diff, manager_data = selected
+                    
+                    role_text = "프라이머리" if is_primary else "세컨더리"
+                    role_color = GREEN if is_primary else YELLOW
+                    
+                    print(f"클러스터 {cluster_id} 관리자: "
+                          f"{manager_id}, "
+                          f"상태: {GREEN}🟢 {role_color}{role_text}{RESET} "
+                          f"({time_diff:.1f}초 전)")
+                elif cluster_info and "manager_id" in cluster_info:
+                    # 클러스터 정보에서 관리자 찾기 (코드 유지 - 이전 방식)
                     manager_id = cluster_info["manager_id"]
                     is_primary = cluster_info.get("is_primary", False)
                     last_updated_diff = current_time - cluster_info.get("last_updated", 0)
@@ -173,46 +208,15 @@ class HATest:
                               f"상태: {RED}🔴 {reason}{RESET} "
                               f"({last_updated_diff:.1f}초 전)")
                 else:
-                    manager_results = self.etcd_client.get_prefix(f"{MANAGER_INFO_PREFIX}/{cluster_id}/")
-                    managers = []
+                    # 선출 진행 중인지 확인
+                    election_key = f"{MANAGER_INFO_PREFIX}/{cluster_id}/election"
+                    election_info = self.etcd_client.get(election_key)
                     
-                    for key, manager_data in manager_results:
-                        if "events/" not in key and "temp_" not in key and "election" not in key:
-                            managers.append(manager_data)
-                    
-                    if managers:
-                        latest_manager = max(managers, key=lambda x: x.get("last_updated", 0))
-                        manager_id = latest_manager["node_id"]
-                        is_primary = latest_manager.get("is_primary", False)
-                        last_updated_diff = current_time - latest_manager.get("last_updated", 0)
-                        
-                        node_is_active = self.check_node_is_active(manager_id)
-                        time_is_valid = last_updated_diff < max_inactive_time
-                        
-                        role_text = "프라이머리" if is_primary else "세컨더리"
-                        role_color = GREEN if is_primary else YELLOW
-                        
-                        if node_is_active and time_is_valid:
-                            print(f"클러스터 {cluster_id} 관리자: "
-                                f"{manager_id}, "
-                                f"상태: {GREEN}🟢 {role_color}{role_text}{RESET} "
-                                f"({last_updated_diff:.1f}초 전)")
-                        else:
-                            reason = "비활성 노드" if not node_is_active else "응답 없음"
-                            print(f"클러스터 {cluster_id} 관리자: "
-                                f"{manager_id}, "
-                                f"상태: {RED}🔴 {reason}{RESET} "
-                                f"({last_updated_diff:.1f}초 전)")
+                    if election_info and election_info.get("status") == "STARTED":
+                        election_time = current_time - election_info.get("timestamp", 0)
+                        print(f"클러스터 {cluster_id} 관리자: {YELLOW}선출 진행 중 ({election_time:.1f}초 전 시작){RESET}")
                     else:
-                        # 선출 진행 중인지 확인
-                        election_key = f"{MANAGER_INFO_PREFIX}/{cluster_id}/election"
-                        election_info = self.etcd_client.get(election_key)
-                        
-                        if election_info and election_info.get("status") == "STARTED":
-                            election_time = current_time - election_info.get("timestamp", 0)
-                            print(f"클러스터 {cluster_id} 관리자: {YELLOW}선출 진행 중 ({election_time:.1f}초 전 시작){RESET}")
-                        else:
-                            print(f"클러스터 {cluster_id} 관리자: {RED}없음{RESET}")
+                        print(f"클러스터 {cluster_id} 관리자: {RED}없음{RESET}")
                 
                 temp_manager_results = self.etcd_client.get_prefix(f"{MANAGER_INFO_PREFIX}/{cluster_id}/temp_")
                 temp_managers = []
@@ -456,11 +460,28 @@ class HATest:
         
         backup_activated = False
         new_manager_elected = False
+        new_manager_id = None
         while time.time() - start_time < max_monitoring_time:
             try:
                 self.active_nodes_cache = {}  
                 self.active_nodes_cache_time = 0
                 
+                # 선출된 새 관리자 확인 (관리자 테이블에서 확인)
+                manager_results = self.etcd_client.get_prefix(f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/")
+                active_managers = []
+                for key, manager_data in manager_results:
+                    if "events/" not in key and "temp_" not in key and "election" not in key and manager_data["node_id"] != self.node_id:
+                        if manager_data.get("status") == "ACTIVE" and manager_data.get("is_primary", False):
+                            active_managers.append(manager_data)
+                
+                if active_managers:
+                    new_manager = sorted(active_managers, key=lambda x: x.get("last_updated", 0), reverse=True)[0]
+                    new_manager_id = new_manager["node_id"]
+                    new_manager_elected = True
+                    if not backup_activated:
+                        print(f"\n{GREEN}[*] 새 관리자가 선출됨: {new_manager_id}{RESET}")
+                
+                # 현재 클러스터 상태 표시
                 self.check_manager_status()
                 elapsed_time = time.time() - start_time
                 print(f"\n=== 경과 시간: {elapsed_time:.1f}초 ===\n")
@@ -488,34 +509,42 @@ class HATest:
                         print(f"\n{GREEN}[*] 임시 관리자 감지: {temp_manager_id}{RESET}")
                         break
                 
-                # 새 관리자 선출 확인
-                if backup_activated:
-                    # 선출 완료 확인
+                # 현재 선출 상태 확인
+                if not new_manager_elected:
                     election_key = f"{MANAGER_INFO_PREFIX}/{self.cluster_id}/election"
                     election_info = self.etcd_client.get(election_key)
                     
-                    if election_info and election_info.get("status") == "COMPLETED":
-                        new_manager_elected = True
-                        new_manager_id = election_info.get("winner_id")
-                        print(f"\n{GREEN}[*] 새 관리자가 선출됨: {new_manager_id}{RESET}")
+                    if election_info:
+                        status = election_info.get("status", "UNKNOWN")
+                        if status == "COMPLETED":
+                            new_manager_elected = True
+                            new_manager_id = election_info.get("winner_id")
+                            print(f"\n{GREEN}[*] 새 관리자가 선출됨: {new_manager_id}{RESET}")
+                        elif status == "STARTED":
+                            print(f"\n{YELLOW}[*] 선출 진행 중 (시작자: {election_info.get('initiator_id', 'unknown')}){RESET}")
+                
+                # 백업 관리자가 활성화되고 새 관리자가 선출되었으면 테스트 종료
+                if backup_activated and new_manager_elected:
+                    # 클러스터 정보에 반영되었는지 확인
+                    cluster_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/info"
+                    cluster_info = self.etcd_client.get(cluster_key)
+                    
+                    if cluster_info and cluster_info.get("manager_id") == new_manager_id:
+                        print(f"\n{GREEN}[+] 클러스터 정보가 새 관리자로 업데이트됨{RESET}")
                         
-                        # 메인 클러스터 정보 확인
-                        cluster_key = f"{CLUSTER_INFO_PREFIX}/{self.cluster_id}/info"
-                        cluster_info = self.etcd_client.get(cluster_key)
-                        
-                        if cluster_info and cluster_info.get("manager_id") == new_manager_id:
-                            print(f"\n{GREEN}[+] 클러스터 정보가 새 관리자로 업데이트됨{RESET}")
-                            
-                            # 백업 관리자 스탠바이 확인
-                            if backup_cluster_id:
+                        # 백업 관리자 스탠바이 확인
+                        if backup_cluster_id:
+                            try:
                                 backup_results = backup_etcd_client.get_prefix(f"{BACKUP_INFO_PREFIX}/{self.cluster_id}/managers/")
                                 for key, backup_data in backup_results:
                                     if backup_data.get("status") == "STANDBY":
                                         print(f"\n{GREEN}[+] 백업 관리자가 STANDBY 상태로 복귀{RESET}")
                                         break
-                            
-                            time.sleep(3)  # 상태가 완전히 갱신되도록 대기
-                            break
+                            except Exception as e:
+                                logger.warning(f"백업 클러스터 상태 확인 중 오류: {e}")
+                        
+                        time.sleep(3)  # 상태가 완전히 갱신되도록 대기
+                        break
                 
                 # 빠른 반복을 위한 대기 시간 설정
                 wait_time = 1.0 if not backup_activated else 2.0
